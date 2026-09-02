@@ -864,9 +864,13 @@ class MooncakeConnectorScheduler:
             self._reqs_not_processed.add(params["transfer_id"])
             return False, None
 
-        # TODO: check whether block_ids actually ever be 0. If not we could
-        # remove the conditional below
-        delay_free_blocks = any(len(group) > 0 for group in block_ids)
+        # NULL_BLOCK_ID placeholders (from sliding-window eviction) mean a
+        # group can be non-empty yet carry no transferable state. Checking
+        # length alone would delay freeing blocks and register an async
+        # send for a request that has nothing real left to transfer.
+        delay_free_blocks = any(
+            block_id != NULL_BLOCK_ID for group in block_ids for block_id in group
+        )
 
         if delay_free_blocks:
             self._reqs_need_send[request.request_id] = (
@@ -1453,21 +1457,6 @@ class MooncakeConnectorWorker:
                     group_specs[group_index].kv_cache_spec,
                     MambaSpec,
                 )
-                if is_mamba_group:
-                    # Mamba/GDN prefix caching can use null blocks only as
-                    # align-mode placeholders. They do not carry transferable
-                    # state, so skip them on both producer and consumer sides.
-                    local_group = [
-                        block_id
-                        for block_id in local_group
-                        if block_id != NULL_BLOCK_ID
-                    ]
-                    remote_group = [
-                        block_id
-                        for block_id in remote_group
-                        if block_id != NULL_BLOCK_ID
-                    ]
-
                 n_local = len(local_group)
                 n_remote = len(remote_group)
                 if n_local < n_remote:
@@ -1484,6 +1473,20 @@ class MooncakeConnectorWorker:
                 elif n_local > n_remote:
                     # Partial prefix cache hit: just read uncomputed blocks.
                     local_group = local_group[-n_remote:] if n_remote > 0 else []
+
+                # Both lists now cover the same token blocks, index for index.
+                # A NULL_BLOCK_ID entry means that position carries no
+                # transferable state, so drop the pair rather than either side
+                # alone: filtering the two lists independently would shift one
+                # against the other and pair blocks from different positions.
+                kept = [
+                    (local_id, remote_id)
+                    for local_id, remote_id in zip(local_group, remote_group)
+                    if local_id != NULL_BLOCK_ID and remote_id != NULL_BLOCK_ID
+                ]
+                local_group = [local_id for local_id, _ in kept]
+                remote_group = [remote_id for _, remote_id in kept]
+
                 local_block_ids_by_group.append(local_group)
                 remote_block_ids_by_group.append(remote_group)
 
